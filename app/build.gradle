@@ -18,8 +18,12 @@ android {
         targetCompatibility JavaVersion.VERSION_1_8
     }
     buildTypes {
+        debug {
+            buildConfigField "String", "SERVER_URL", serverUrl
+        }
         release {
             minifyEnabled false
+            buildConfigField "String", "SERVER_URL", serverUrl
         }
     }
 }
@@ -39,5 +43,6 @@ dependencies {
     //eventbus
     compile 'org.greenrobot:eventbus:3.0.0'
 
+    compile group: 'com.google.code.gson', name: 'gson', version: '1.7.2'
 
 }

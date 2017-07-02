@@ -1,14 +1,25 @@
 package com.example.aleks.simplechatroulette;
 
+import android.app.FragmentManager;
+import android.content.BroadcastReceiver;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.ServiceConnection;
+import android.os.IBinder;
+import android.support.v4.content.LocalBroadcastManager;
 import android.support.v7.app.AppCompatActivity;
 import android.support.annotation.NonNull;
 import android.Manifest;
 import android.os.Bundle;
 import android.util.Log;
+import android.view.View;
 import android.widget.FrameLayout;
 import android.app.AlertDialog;
-import android.widget.Toast;
 
+import com.example.aleks.simplechatroulette.services.WebCoordinatorService;
+import com.google.gson.Gson;
 import com.opentok.android.Session;
 import com.opentok.android.Stream;
 import com.opentok.android.Publisher;
@@ -16,10 +27,6 @@ import com.opentok.android.PublisherKit;
 import com.opentok.android.Subscriber;
 import com.opentok.android.BaseVideoRenderer;
 import com.opentok.android.OpentokError;
-
-import org.greenrobot.eventbus.EventBus;
-import org.greenrobot.eventbus.Subscribe;
-import org.greenrobot.eventbus.ThreadMode;
 
 import java.util.List;
 
@@ -36,19 +43,21 @@ public class MainActivity extends AppCompatActivity
 
     private static final int RC_VIDEO_APP_PERM = 0;
 
-    // Suppressing this warning. mWebServiceCoordinator will get GarbageCollected if it is local.
-    @SuppressWarnings("FieldCanBeLocal")
-    private WebServiceCoordinator mWebServiceCoordinator;
+    private DataFragment dataFragment;
 
-    private Session mSession;
-    private Publisher mPublisher;
-    private Subscriber mSubscriber;
+    private Session session;
+    private Publisher publisher;
+    private Subscriber subscriber;
     private String token;
 
     @BindView(R.id.publisher_container)
-    FrameLayout mPublisherViewContainer;
+    FrameLayout publisherViewContainer;
     @BindView(R.id.subscriber_container)
-    FrameLayout mSubscriberViewContainer;
+    FrameLayout subscriberViewContainer;
+
+    WebCoordinatorService webCoordinatorService;
+    // flag indicating whether we have called bind on the service
+    boolean serviceBound;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -58,20 +67,53 @@ public class MainActivity extends AppCompatActivity
         ButterKnife.bind(MainActivity.this);
 
         // initialize view objects from your layout
-        mPublisherViewContainer = (FrameLayout)findViewById(R.id.publisher_container);
-        mSubscriberViewContainer = (FrameLayout)findViewById(R.id.subscriber_container);
+        publisherViewContainer = (FrameLayout)findViewById(R.id.publisher_container);
+        subscriberViewContainer = (FrameLayout)findViewById(R.id.subscriber_container);
+
+        FragmentManager fm = getFragmentManager();
+        dataFragment = (DataFragment) fm.findFragmentByTag("data");
+        if (dataFragment == null) {
+            dataFragment = new DataFragment();
+            fm.beginTransaction().add(dataFragment, "data").commit();
+        }
+        else {
+            session = dataFragment.getSession();
+            publisher = dataFragment.getPublisher();
+            subscriber = dataFragment.getSubscriber();
+            token = dataFragment.getToken();
+            if (session != null)
+                session.setSessionListener(this);
+            if (publisher != null) {
+                publisher.setPublisherListener(this);
+            }
+        }
 
         requestPermissions();
     }
+
+    private ServiceConnection serviceConnection = new ServiceConnection() {
+        @Override
+        public void onServiceConnected(ComponentName className, IBinder service) {
+            WebCoordinatorService.LocalBinder binder = (WebCoordinatorService.LocalBinder) service;
+            webCoordinatorService = binder.getService();
+            serviceBound = true;
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName arg0) {
+            serviceBound = false;
+            webCoordinatorService = null;
+        }
+    };
 
     @Override
     protected void onPause() {
         Log.d(LOG_TAG, "onPause");
         super.onPause();
-        if (mSession == null) {
+        if (session == null) {
             return;
         }
-        mSession.onPause();
+        session.onPause();
         if (isFinishing()) {
             disconnectSession();
         }
@@ -81,29 +123,62 @@ public class MainActivity extends AppCompatActivity
     protected void onResume() {
         Log.d(LOG_TAG, "onResume");
         super.onResume();
-        if (mSession != null) {
-            mSession.onResume();
+        if (session != null) {
+            session.onResume();
         }
+        LocalBroadcastManager.getInstance(this)
+                .registerReceiver(messageReceiver, new IntentFilter("WebCoordinatorServiceEvents"));
     }
 
     @Override
     public void onStart() {
         super.onStart();
-        EventBus.getDefault().register(this);
+        bindService(new Intent(this, WebCoordinatorService.class), serviceConnection, Context.BIND_AUTO_CREATE);
+        if (publisher != null)
+            publisherViewContainer.addView(publisher.getView());
+        if (subscriber != null)
+            subscriberViewContainer.addView(subscriber.getView());
     }
 
     @Override
     public void onStop() {
-        EventBus.getDefault().unregister(this);
+        if (serviceBound) {
+            unbindService(serviceConnection);
+            serviceBound = false;
+        }
+        publisherViewContainer.removeAllViews();
+        subscriberViewContainer.removeAllViews();
+
+        dataFragment.setSession(session);
+        dataFragment.setPublisher(publisher);
+        dataFragment.setSubscriber(subscriber);
+        dataFragment.setToken(token);
         super.onStop();
     }
 
     @Override
     protected void onDestroy() {
         Log.d(LOG_TAG, "onDestroy");
-        disconnectSession();
         super.onDestroy();
     }
+
+    private BroadcastReceiver messageReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String eventType = intent.getStringExtra("eventType");
+            String message = intent.getStringExtra("message");
+            if (eventType.equals(WebCoordinatorService.WebCoordinatorServiceEventType.SessionConnectionDataReadyEvent.toString())) {
+                WebCoordinatorService.SessionConnectionDataReadyEvent messageObj = new Gson().fromJson(message,
+                        WebCoordinatorService.SessionConnectionDataReadyEvent.class);
+                onSessionConnectionDataReady(messageObj);
+            }
+            else if (eventType.equals(WebCoordinatorService.WebCoordinatorServiceEventType.SessionConnectionDataReadyEvent.toString())) {
+                WebCoordinatorService.WebCoordinatorServiceErrorEvent messageObj = new Gson().fromJson(message,
+                        WebCoordinatorService.WebCoordinatorServiceErrorEvent.class);
+                onWebServiceCoordinatorError(messageObj);
+            }
+        }
+    };
 
     @Override
     public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
@@ -128,8 +203,7 @@ public class MainActivity extends AppCompatActivity
         if (EasyPermissions.hasPermissions(this, perms)) {
             // initialize WebServiceCoordinator and kick off request for session data
             // session initialization occurs once data is returned, in onSessionConnectionDataReady
-            mWebServiceCoordinator = new WebServiceCoordinator();
-            mWebServiceCoordinator.connectWebSocket();
+            startService(new Intent(this, WebCoordinatorService.class));
         }
         else {
             EasyPermissions.requestPermissions(this, getString(R.string.rationale_video_app), RC_VIDEO_APP_PERM, perms);
@@ -138,22 +212,20 @@ public class MainActivity extends AppCompatActivity
 
     private void initializeSession(String apiKey, String sessionId, String token) {
         this.token = token;
-        mSession = new Session.Builder(this, apiKey, sessionId).build();
-        mSession.setSessionListener(this);
-        mSession.connect(token);
+        session = new Session.Builder(this, apiKey, sessionId).build();
+        session.setSessionListener(this);
+        session.connect(token);
     }
 
-    @Subscribe(threadMode = ThreadMode.MAIN)
-    public void onSessionConnectionDataReady(WebServiceCoordinator.SessionConnectionDataReadyEvent event) {
+    public void onSessionConnectionDataReady(WebCoordinatorService.SessionConnectionDataReadyEvent event) {
         Log.d(LOG_TAG, "ApiKey: " + event.apiKey + " SessionId: " + event.sessionId + " Token: " + event.token);
         disconnectSession();
         initializeSession(event.apiKey, event.sessionId, event.token);
     }
 
-    @Subscribe(threadMode = ThreadMode.MAIN)
-    public void onWebServiceCoordinatorError(WebServiceCoordinator.WebServiceCoordinatorErrorEvent event) {
+    public void onWebServiceCoordinatorError(WebCoordinatorService.WebCoordinatorServiceErrorEvent event) {
         Log.e(LOG_TAG, "WebServiceCoordinatorError: " + event.errorMessage);
-        MainActivity.this.runOnUiThread(() ->showFinishingDialog("Error", event.errorMessage));
+        showFinishingDialog("Error", event.errorMessage);
     }
 
     @Override
@@ -161,15 +233,15 @@ public class MainActivity extends AppCompatActivity
         Log.d(LOG_TAG, "onConnected: Connected to session: "+session.getSessionId());
 
         // initialize Publisher and set this object to listen to Publisher events
-        mPublisher = new Publisher.Builder(this).build();
-        mPublisher.setPublisherListener(this);
+        publisher = new Publisher.Builder(this).build();
+        publisher.setPublisherListener(this);
 
         // set publisher video style to fill view
-        mPublisher.getRenderer().setStyle(BaseVideoRenderer.STYLE_VIDEO_SCALE,
+        publisher.getRenderer().setStyle(BaseVideoRenderer.STYLE_VIDEO_SCALE,
                 BaseVideoRenderer.STYLE_VIDEO_FILL);
-        mPublisherViewContainer.addView(mPublisher.getView());
+        publisherViewContainer.addView(publisher.getView());
 
-        mSession.publish(mPublisher);
+        this.session.publish(publisher);
     }
 
     @Override
@@ -181,22 +253,22 @@ public class MainActivity extends AppCompatActivity
     public void onStreamReceived(Session session, Stream stream) {
         Log.d(LOG_TAG, "onStreamReceived: New Stream Received "+stream.getStreamId() + " in session: "+session.getSessionId());
 
-        if (mSubscriber == null) {
-            mSubscriber = new Subscriber.Builder(this, stream).build();
-            mSubscriber.getRenderer().setStyle(BaseVideoRenderer.STYLE_VIDEO_SCALE, BaseVideoRenderer.STYLE_VIDEO_FILL);
-            mSession.subscribe(mSubscriber);
-            mSubscriberViewContainer.addView(mSubscriber.getView());
+        if (subscriber == null) {
+            subscriber = new Subscriber.Builder(this, stream).build();
+            subscriber.getRenderer().setStyle(BaseVideoRenderer.STYLE_VIDEO_SCALE, BaseVideoRenderer.STYLE_VIDEO_FILL);
+            this.session.subscribe(subscriber);
+            subscriberViewContainer.addView(subscriber.getView());
         }
     }
 
     @Override
     public void onStreamDropped(Session session, Stream stream) {
         Log.d(LOG_TAG, "onStreamDropped: Stream Dropped: "+stream.getStreamId() +" in session: "+session.getSessionId());
-        if (mSubscriber != null) {
-            mSubscriber = null;
-            mSubscriberViewContainer.removeAllViews();
+        if (subscriber != null) {
+            subscriber = null;
+            subscriberViewContainer.removeAllViews();
         }
-        mWebServiceCoordinator.fetchSessionConnectionData(mSession.getSessionId(), token);
+        webCoordinatorService.fetchSessionConnectionData(this.session.getSessionId(), token);
     }
 
     @Override
@@ -227,25 +299,25 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void disconnectSession() {
-        if (mSession == null) {
+        if (session == null) {
             return;
         }
 
-        if (mSubscriber != null) {
-            mSession.unsubscribe(mSubscriber);
-            mSubscriberViewContainer.removeAllViews();
-            mSubscriber.destroy();
-            mSubscriber = null;
+        if (subscriber != null) {
+            session.unsubscribe(subscriber);
+            subscriberViewContainer.removeAllViews();
+            subscriber.destroy();
+            subscriber = null;
         }
 
-        if (mPublisher != null) {
-            mSession.unpublish(mPublisher);
-            mPublisherViewContainer.removeAllViews();
-            mPublisher.destroy();
-            mPublisher = null;
+        if (publisher != null) {
+            session.unpublish(publisher);
+            publisherViewContainer.removeAllViews();
+            publisher.destroy();
+            publisher = null;
         }
 
-        mSession.disconnect();
+        session.disconnect();
     }
 
     void showFinishingDialog(String title, String message) {
